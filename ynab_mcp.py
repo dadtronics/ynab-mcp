@@ -176,7 +176,7 @@ def default_since(days):
 
 def t_budgets(a):
     bs = api("GET", "/budgets")["budgets"]
-    return "\n".join(f"{b['name']} | months {(b.get('first_month') or '')[:7]} to {(b.get('last_month') or '')[:7]}"
+    return f"{len(bs)} budgets:\n" + "\n".join(f"{b['name']} | months {(b.get('first_month') or '')[:7]} to {(b.get('last_month') or '')[:7]}"
                      f" | last modified {(b.get('last_modified_on') or '')[:10]} | id {b['id']}" for b in bs)
 
 
