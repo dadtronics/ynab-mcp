@@ -214,6 +214,27 @@ class Tools(unittest.TestCase):
             self.run_tool("confirm", codes=[code, "bogus"])
         self.assertEqual(self.writes(), [])
 
+    def test_payment_category_target_rules(self):
+        # card payment: amount ok, frequency/mode refused before staging
+        self.staged_code(self.run_tool("update_category", category="Example Card", target_amount=500))
+        with self.assertRaisesRegex(RuntimeError, "credit card payment"):
+            self.run_tool("update_category", category="Example Card", target_amount=500, target_frequency="monthly")
+        # one bad item in a batch stops the whole batch from being staged
+        with self.assertRaisesRegex(RuntimeError, "credit card payment"):
+            self.run_tool("update_category", changes=[{"category": "Groceries", "target_amount": 650},
+                                                      {"category": "Example Card", "target_mode": "refill"}])
+        self.assertEqual(len(y._pending), 1)
+
+    def test_target_combination_rules(self):
+        for args, msg in [({"target_frequency": "monthly"}, "needs target_amount"),
+                          ({"target_amount": 100, "target_frequency": "yearly"}, "needs target_date"),
+                          ({"target_amount": 10, "target_frequency": "weekly", "target_date": "2027-01-01"}, "weekly"),
+                          ({"target_mode": "refill"}, "only applies to plan-your-spending")]:
+            with self.assertRaisesRegex(RuntimeError, msg):
+                self.run_tool("update_category", category="Streaming", **args)
+        self.staged_code(self.run_tool("update_category", category="Streaming", target_amount=20,
+                                       target_frequency="monthly", target_mode="refill"))
+
     def test_refusals(self):
         for tool, args in [("update_transactions", {"changes": [{"id": "s1", "category": "Groceries"}]}),
                            ("create_category", {"name": "Groceries", "group": "everyday"}),

@@ -570,25 +570,60 @@ def category_groups(b):
             if not g["deleted"] and not g["hidden"] and g["name"] not in INTERNAL_GROUPS]
 
 
-def target_fields(a, body, what, old=None):
-    """Shared target (goal) options for create/update_category."""
+LOAN_TYPES = DEBT_TYPES - CARD_TYPES - {"otherLiability"}
+
+
+def payment_kind(b, c):
+    """'card' for a credit card payment category, 'loan' for one paired to a loan account, else None."""
+    if c.get("group") == "Credit Card Payments":
+        return "card"
+    if c.get("goal_type") == "DEBT":
+        return "loan"
+    loans = {x["name"].lower() for x in api("GET", f"/budgets/{b}/accounts")["accounts"]
+             if x["type"] in LOAN_TYPES and not x["deleted"]}
+    return "loan" if c["name"].lower() in loans else None
+
+
+def target_fields(a, body, what, old=None, kind=None):
+    """Shared target (goal) options for create/update_category. Checks YNAB's rules before anything is staged."""
     old = old or {}
+    name = old.get("name") or a.get("name") or "this category"
     if a.get("remove_target"):
         body["goal_target"] = None
         what.append(f"remove target ({money(old.get('goal_target'))})")
         return
+    freq, tdate, mode = a.get("target_frequency"), a.get("target_date"), a.get("target_mode")
+    if kind and (freq or mode):
+        label = "credit card payment" if kind == "card" else "loan payment"
+        raise RuntimeError(f"{name} is a {label} category: YNAB only lets the API set its target amount"
+                           + (" and target date" if kind == "card" else "")
+                           + ". Drop target_frequency/target_mode for it (it keeps its existing target style).")
+    if kind == "loan" and tdate:
+        raise RuntimeError(f"{name} is a loan payment category: YNAB doesn't support a target date for it. Drop target_date.")
+    if freq and a.get("target_amount") is None:
+        raise RuntimeError(f"{name}: target_frequency needs target_amount too.")
+    if freq == "yearly" and not tdate:
+        raise RuntimeError(f"{name}: a yearly target needs target_date (when it's next due).")
+    if freq == "weekly" and tdate:
+        raise RuntimeError(f"{name}: a weekly target can't have a target_date.")
+    if mode and not freq and old.get("goal_type") not in (None, "NEED"):
+        raise RuntimeError(f"{name}: target_mode only applies to plan-your-spending (NEED) targets; "
+                           f"this one is {GOAL_TYPES.get(old.get('goal_type'), old.get('goal_type'))}. "
+                           "Pass target_frequency too to replace it with a NEED target.")
     if a.get("target_amount") is not None:
+        if float(a["target_amount"]) < 0:
+            raise RuntimeError(f"{name}: target_amount can't be negative.")
         body["goal_target"] = to_milli(a["target_amount"])
         what.append(f"target {money(old.get('goal_target')) if old.get('goal_type') else 'none'} -> {money(body['goal_target'])}")
-    if a.get("target_date"):
-        date.fromisoformat(a["target_date"])
-        body["goal_target_date"] = a["target_date"]
-        what.append(f"target date -> {a['target_date']}")
-    if a.get("target_frequency"):
-        body["goal_frequency"] = a["target_frequency"]
-        what.append(f"repeats {a['target_frequency']}")
-    if a.get("target_mode"):
-        body["goal_needs_whole_amount"] = a["target_mode"] == "set_aside"
+    if tdate:
+        date.fromisoformat(tdate)
+        body["goal_target_date"] = tdate
+        what.append(f"target date -> {tdate}")
+    if freq:
+        body["goal_frequency"] = freq
+        what.append(f"repeats {freq}")
+    if mode:
+        body["goal_needs_whole_amount"] = mode == "set_aside"
         what.append("'Set aside another' each period" if body["goal_needs_whole_amount"] else "'Refill up to' the target")
 
 
@@ -656,7 +691,7 @@ def t_update_category(a):
             if g["name"] != c["group"]:
                 body["category_group_id"] = g["id"]
                 what.append(f"move from group {c['group']} -> {g['name']}")
-        target_fields(it, body, what, c)
+        target_fields(it, body, what, c, payment_kind(b, c))
         if not body:
             raise RuntimeError(f"Nothing to change for {c['name']}")
         steps.append(("PATCH", f"/budgets/{b}/categories/{c['id']}", {"category": body}))
