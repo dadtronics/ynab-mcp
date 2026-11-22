@@ -35,12 +35,14 @@ Not affiliated with or endorsed by YNAB.
 | `transfer` | Record a transfer or card/loan payment between accounts |
 | `assign` | Set or add to a category's assigned amount for a month |
 | `move_money` | Move assigned money between categories |
-| `create_category` / `update_category` | Create, rename, note, move to another group, add/change/remove targets |
+| `create_category` | Create one or many categories (with targets) in one approval; missing groups are created in the same change |
+| `update_category` | Rename, note, move to another group, add/change/remove targets; one or many in one approval |
 | `create_category_group` / `rename_category_group` | Manage groups |
 | `create_account` | Checking, savings, cash, credit card, other asset/liability |
-| `confirm` | Apply a staged change by its code |
+| `confirm` | Apply staged changes by code (`codes` applies several approved changes at once) |
 
-Categories and accounts can be referred to by name (case-insensitive; a unique substring is fine).
+Budgets, categories and accounts can be referred to by name (case-insensitive; a unique substring is fine).
+Categories also accept `Group / Name`, the form the `categories` tool prints.
 All amounts are dollars; outflows are negative.
 
 Not possible through YNAB's API, so not here: deleting, hiding, reordering or merging categories;

@@ -62,6 +62,8 @@ def api(method, path, body=None, cache=True):
             msg = f"{err.get('name')}: {err.get('detail')}"
         except Exception:
             msg = str(e)
+        if e.code == 404 and "/months/" in path:
+            msg += " (that month is outside this budget's range; the budgets tool shows each budget's first/last month)"
         if e.code == 429:
             msg += " (YNAB rate limit: 200 requests/hour; wait and retry)"
         raise RuntimeError(f"YNAB API {method} {path} failed ({e.code}) {msg}")
@@ -118,11 +120,12 @@ def categories(b):
 
 
 def find(items, want, kind, label=lambda x: x["name"]):
-    w = str(want).strip().lower()
+    w = " ".join(str(want).split()).lower()
+    full = lambda x: f"{x['group']} / {label(x)}".lower() if x.get("group") else label(x).lower()
     for x in items:
-        if x["id"] == want or label(x).lower() == w:
+        if x["id"] == want or label(x).lower() == w or full(x) == w:
             return x
-    hits = [x for x in items if w in label(x).lower()]
+    hits = [x for x in items if w in label(x).lower()] or [x for x in items if w in full(x)]
     if len(hits) == 1:
         return hits[0]
     if hits:
@@ -169,7 +172,8 @@ def default_since(days):
 
 def t_budgets(a):
     bs = api("GET", "/budgets")["budgets"]
-    return "\n".join(f"{b['name']} | id {b['id']} | last modified {b.get('last_modified_on', '')[:10]}" for b in bs)
+    return "\n".join(f"{b['name']} | months {(b.get('first_month') or '')[:7]} to {(b.get('last_month') or '')[:7]}"
+                     f" | last modified {(b.get('last_modified_on') or '')[:10]} | id {b['id']}" for b in bs)
 
 
 def t_overview(a):
@@ -589,39 +593,75 @@ def target_fields(a, body, what, old=None):
 
 
 def t_create_category(a):
+    """One category (name + group) or many (categories list). Missing groups are created first, in the same change."""
     b = budget_id(a)
-    g = find(category_groups(b), a["group"], "Category group")
-    if any(c["name"].lower() == a["name"].strip().lower() for c in categories(b)):
-        raise RuntimeError(f"A category named '{a['name']}' already exists")
-    body, what = {"name": a["name"].strip(), "category_group_id": g["id"]}, []
-    if a.get("note"):
-        body["note"] = a["note"]
-        what.append(f"note '{a['note']}'")
-    target_fields(a, body, what)
-    return stage(f"Create category '{body['name']}' in group {g['name']}" + (": " + "; ".join(what) if what else ""),
-                 "POST", f"/budgets/{b}/categories", {"category": body}, b)
+    items = a.get("categories") or [a]
+    groups = category_groups(b)
+    taken = {c["name"].lower() for c in categories(b)}
+    new_groups, steps, lines_ = {}, [], []
+    for it in items:
+        name, gname = (it.get("name") or "").strip(), (it.get("group") or "").strip()
+        if not name or not gname:
+            raise RuntimeError(f"Each category needs a name and a group: {it}")
+        if name.lower() in taken:
+            raise RuntimeError(f"A category named '{name}' already exists (or is listed twice)")
+        if gname.lower() in {g.lower() for g in INTERNAL_GROUPS}:
+            raise RuntimeError(f"Can't add categories to '{gname}': YNAB manages that group itself "
+                               "(credit card payment categories are created automatically per card)")
+        taken.add(name.lower())
+        try:
+            g = find(groups, gname, "Category group")
+            gid, glabel = g["id"], g["name"]
+        except RuntimeError as e:
+            if "ambiguous" in str(e):
+                raise
+            key = gname.lower()
+            if key not in new_groups:
+                if len(gname) > 50:
+                    raise RuntimeError("Group names are limited to 50 characters")
+                new_groups[key] = gname
+                steps.append(("POST", f"/budgets/{b}/category_groups", {"category_group": {"name": gname}}, f"group:{key}"))
+            gid, glabel = ("$ref", f"group:{key}"), f"{new_groups[key]} (NEW GROUP)"
+        body, what = {"name": name, "category_group_id": gid}, []
+        if it.get("note"):
+            body["note"] = it["note"]
+            what.append(f"note '{it['note']}'")
+        target_fields(it, body, what)
+        steps.append(("POST", f"/budgets/{b}/categories", {"category": body}, None))
+        lines_.append(f"- '{name}' in {glabel}" + (": " + "; ".join(what) if what else ""))
+    head = f"Create {len(lines_)} categor{'y' if len(lines_) == 1 else 'ies'}"
+    if new_groups:
+        head += f" and {len(new_groups)} new group(s): " + ", ".join(new_groups.values())
+    return stage(head + "\n" + "\n".join(lines_), "MULTI", None, steps, b)
 
 
 def t_update_category(a):
+    """One category (category + fields) or many (changes list), staged as a single change."""
     b = budget_id(a)
-    c = find_category(b, a["category"])
-    body, what = {}, []
-    if a.get("new_name"):
-        body["name"] = a["new_name"].strip()
-        what.append(f"rename -> '{body['name']}'")
-    if "note" in a:
-        body["note"] = a["note"] or None
-        what.append(f"note -> '{a['note']}'" if a["note"] else "clear note")
-    if a.get("group"):
-        g = find(category_groups(b), a["group"], "Category group")
-        if g["name"] != c["group"]:
-            body["category_group_id"] = g["id"]
-            what.append(f"move from group {c['group']} -> {g['name']}")
-    target_fields(a, body, what, c)
-    if not body:
-        raise RuntimeError("Nothing to change")
-    return stage(f"Update category {c['group']} / {c['name']}:\n- " + "\n- ".join(what), "PATCH",
-                 f"/budgets/{b}/categories/{c['id']}", {"category": body}, b)
+    items = a.get("changes") or [a]
+    groups = None
+    steps, out = [], []
+    for it in items:
+        c = find_category(b, it["category"])
+        body, what = {}, []
+        if it.get("new_name"):
+            body["name"] = it["new_name"].strip()
+            what.append(f"rename -> '{body['name']}'")
+        if "note" in it:
+            body["note"] = it["note"] or None
+            what.append(f"note -> '{it['note']}'" if it["note"] else "clear note")
+        if it.get("group"):
+            groups = groups or category_groups(b)
+            g = find(groups, it["group"], "Category group")
+            if g["name"] != c["group"]:
+                body["category_group_id"] = g["id"]
+                what.append(f"move from group {c['group']} -> {g['name']}")
+        target_fields(it, body, what, c)
+        if not body:
+            raise RuntimeError(f"Nothing to change for {c['name']}")
+        steps.append(("PATCH", f"/budgets/{b}/categories/{c['id']}", {"category": body}))
+        out.append(f"- {c['group']} / {c['name']}: " + "; ".join(what))
+    return stage(f"Update {len(out)} categor{'y' if len(out) == 1 else 'ies'}:\n" + "\n".join(out), "MULTI", None, steps, b)
 
 
 def t_create_category_group(a):
@@ -665,20 +705,45 @@ def t_create_account(a):
                  "POST", f"/budgets/{b}/accounts", {"account": body}, b)
 
 
-def t_confirm(a):
-    code = str(a.get("code", "")).strip()
-    p = _pending.pop(code, None)
-    if not p or time.time() - p["at"] > PENDING_TTL:
-        raise RuntimeError("Unknown or expired code. Stage the change again and get the user's approval.")
+def _apply(code, p):
     steps = p["body"] if p["method"] == "MULTI" else [(p["method"], p["path"], p["body"])]
-    for i, (method, path, body) in enumerate(steps):
+    refs = {}
+
+    def resolve(v):
+        if isinstance(v, tuple) and v and v[0] == "$ref":
+            return refs[v[1]]
+        if isinstance(v, dict):
+            return {k: resolve(x) for k, x in v.items()}
+        return v
+
+    for i, step in enumerate(steps):
+        method, path, body = step[:3]
         try:
-            api(method, path, body)
+            data = api(method, path, resolve(body))
         except RuntimeError as e:
-            done = f" Steps 1-{i} were applied; step {i + 1} failed, so check YNAB." if i else ""
+            done = f" Steps 1-{i} of {len(steps)} were applied; step {i + 1} failed, so check YNAB." if i else ""
             raise RuntimeError(f"{e}.{done}")
+        if len(step) > 3 and step[3]:
+            refs[step[3]] = data["category_group"]["id"]
     log("applied", code, p["desc"].splitlines()[0])
     return f"APPLIED:\n{p['desc']}"
+
+
+def t_confirm(a):
+    codes = [str(c).strip() for c in (a.get("codes") or [a.get("code", "")])]
+    now = time.time()
+    missing = [c for c in codes if c not in _pending or now - _pending[c]["at"] > PENDING_TTL]
+    if missing:
+        raise RuntimeError(f"Unknown or expired code(s) {', '.join(missing)}; nothing was applied. "
+                           "Stage the change again and get the user's approval.")
+    done = []
+    for c in codes:
+        p = _pending.pop(c)
+        try:
+            done.append(_apply(c, p))
+        except RuntimeError as e:
+            raise RuntimeError(f"{e}" + (f"\nAlready applied before this failure:\n" + "\n".join(done) if done else ""))
+    return "\n\n".join(done)
 
 
 # ---------------------------------------------------------------- MCP plumbing
@@ -698,6 +763,11 @@ def obj(props, req=()):
 
 RO = {"readOnlyHint": True, "openWorldHint": True}
 RW = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True}
+
+UPDATE_CAT = {"category": {"type": "string", "description": "Name, or 'Group / Name' as the categories tool shows"},
+              "new_name": {"type": "string"}, "note": {"type": "string"},
+              "group": {"type": "string", "description": "Move to this existing group"},
+              "remove_target": {"type": "boolean"}, **TARGET}
 
 TOOLS = [
     ("budgets", t_budgets, "List YNAB budgets.", {"type": "object", "properties": {}}, RO),
@@ -754,16 +824,21 @@ TOOLS = [
           "minimum_payments": {"type": "object", "description": "Account name -> monthly minimum in dollars",
                                "additionalProperties": {"type": "number"}},
           "accounts": {"type": "array", "items": {"type": "string"}, "description": "Only these debts"}}), RO),
-    ("create_category", t_create_category, "STAGE creating a category in an existing group, optionally with a target. "
-     "Needs user approval + confirm.",
-     obj({"name": {"type": "string"}, "group": {"type": "string"}, "note": {"type": "string"}, **TARGET},
-         ["name", "group"]), RW),
-    ("update_category", t_update_category, "STAGE renaming a category, editing its note, moving it to another group, "
+    ("create_category", t_create_category, "STAGE creating one or many categories, optionally with targets. "
+     "For several, pass them all in `categories` so the user approves once. A group that doesn't exist yet is "
+     "created in the same change. Needs user approval + confirm.",
+     obj({"name": {"type": "string", "description": "Single category name (or use categories)"},
+          "group": {"type": "string", "description": "Group name; created if it doesn't exist"},
+          "note": {"type": "string"}, **TARGET,
+          "categories": {"type": "array", "description": "Several categories at once",
+                         "items": {"type": "object", "properties": {
+                             "name": {"type": "string"}, "group": {"type": "string"}, "note": {"type": "string"},
+                             **TARGET}, "required": ["name", "group"]}}}), RW),
+    ("update_category", t_update_category, "STAGE (one or, via changes, many) renaming a category, editing its note, moving it to another group, "
      "or adding/changing/removing its target. Needs user approval + confirm. (Deleting/hiding categories is not "
      "possible through the API; the user must do that in YNAB.)",
-     obj({"category": {"type": "string"}, "new_name": {"type": "string"}, "note": {"type": "string"},
-          "group": {"type": "string", "description": "Move to this group"},
-          "remove_target": {"type": "boolean"}, **TARGET}, ["category"]), RW),
+     obj({**UPDATE_CAT, "changes": {"type": "array", "description": "Several categories at once (one approval)",
+                                     "items": {"type": "object", "properties": UPDATE_CAT, "required": ["category"]}}}), RW),
     ("create_category_group", t_create_category_group, "STAGE creating a category group. Needs user approval + confirm.",
      obj({"name": {"type": "string"}}, ["name"]), RW),
     ("rename_category_group", t_rename_category_group, "STAGE renaming a category group. Needs user approval + confirm.",
@@ -781,16 +856,23 @@ TOOLS = [
           "balance": {"type": "number", "description": "Starting balance in dollars (negative for a card owing money)"}},
          ["name", "type"]), RW),
     ("confirm", t_confirm, "Apply a staged change. ONLY call this after the user has seen the preview and explicitly "
-     "said yes in their own message.", {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+     "said yes in their own message. Pass several approved codes in codes to apply them together.",
+     {"type": "object", "properties": {"code": {"type": "string"},
+                                       "codes": {"type": "array", "items": {"type": "string"}}}},
      {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True}),
 ]
 BY_NAME = {t[0]: t for t in TOOLS}
 
 INSTRUCTIONS = (
-    "YNAB budget tools. Amounts are dollars; outflows negative. Category and account arguments accept names "
-    "(case-insensitive, unique substring ok). Start with overview. Write tools only stage a change: show the "
-    "preview to the user word for word, wait for an explicit yes, then call confirm with the code. Never call "
-    "confirm in the same turn you staged, and never on your own initiative. Report numbers exactly as the tools give them."
+    "YNAB budget tools. Amounts are dollars; outflows negative. Refer to budgets by name (from the budgets tool) "
+    "and to categories/accounts by name; 'Group / Name' as printed by the categories tool also works. "
+    "Start with overview. Write tools only STAGE a change and return a preview + code. Workflow for changes: "
+    "(1) put ALL related changes in as few calls as possible: create_category with a categories list (missing groups "
+    "are created automatically, so never stage create_category_group first), update_category with a changes list; "
+    "(2) show every preview to the user word for word and stop; (3) only after the user says yes, call confirm once "
+    "with all the approved codes in codes. Never confirm in the same turn you staged, never on your own initiative. "
+    "Changes staged together don't see each other until confirmed, so don't stage a change that depends on another "
+    "unconfirmed one. Report numbers exactly as the tools give them."
 )
 
 

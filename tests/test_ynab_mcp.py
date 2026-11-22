@@ -66,6 +66,8 @@ class FakeAPI:
 
     def __call__(self, method, path, body=None, cache=True):
         self.calls.append((method, path, body))
+        if method == "POST" and path.endswith("/category_groups"):
+            return {"category_group": {"id": "new-group-id", "name": body["category_group"]["name"]}}
         if method != "GET":
             return {}
         if path == "/budgets":
@@ -177,6 +179,40 @@ class Tools(unittest.TestCase):
         self.run_tool("confirm", code=code)
         body = self.writes()[0][2]["transaction"]
         self.assertEqual((body["account_id"], body["amount"], body["payee_id"]), ("a1", -300000, "tp3"))
+
+    def test_group_slash_name_lookup(self):
+        r = self.run_tool("update_category", category="Everyday / Dining Out", new_name="Restaurants")
+        self.assertIn("Everyday / Dining Out: rename -> 'Restaurants'", r)
+        self.assertIn("Example Card", self.run_tool("update_category", category="Credit Card Payments / Example Card",
+                                                     note="pay in full"))
+
+    def test_batch_create_with_new_group(self):
+        r = self.run_tool("create_category", categories=[
+            {"name": "Car Loan Payment", "group": "Loans", "target_amount": 350},
+            {"name": "Student Loan", "group": "loans"},
+            {"name": "Gifts", "group": "Everyday"}])
+        self.assertIn("Create 3 categories and 1 new group(s): Loans", r)
+        self.assertIn("'Student Loan' in Loans (NEW GROUP)", r)
+        self.run_tool("confirm", code=self.staged_code(r))
+        w = self.writes()
+        self.assertEqual([c[1].rsplit("/", 1)[1] for c in w], ["category_groups", "categories", "categories", "categories"])
+        self.assertEqual([c[2]["category"]["category_group_id"] for c in w[1:]], ["new-group-id", "new-group-id", "g1"])
+
+    def test_batch_update_and_multi_confirm(self):
+        r1 = self.run_tool("update_category", changes=[
+            {"category": "Groceries", "target_amount": 650},
+            {"category": "Streaming", "remove_target": True}])
+        self.assertIn("Update 2 categories", r1)
+        r2 = self.run_tool("assign", category="Dining", amount=50, mode="add")
+        out = self.run_tool("confirm", codes=[self.staged_code(r1), self.staged_code(r2)])
+        self.assertEqual(out.count("APPLIED"), 2)
+        self.assertEqual(len(self.writes()), 3)
+
+    def test_multi_confirm_checks_all_codes_first(self):
+        code = self.staged_code(self.run_tool("assign", category="Dining", amount=50))
+        with self.assertRaises(RuntimeError):
+            self.run_tool("confirm", codes=[code, "bogus"])
+        self.assertEqual(self.writes(), [])
 
     def test_refusals(self):
         for tool, args in [("update_transactions", {"changes": [{"id": "s1", "category": "Groceries"}]}),
