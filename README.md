@@ -27,7 +27,7 @@ Not affiliated with or endorsed by YNAB.
 | `transactions` | Filter by date, account, category, payee, or uncategorized/unapproved. Splits are expanded. |
 | `spending` | Totals by category, group, payee, or month (trends), excluding transfers |
 | `recurring` | Detects subscriptions and other recurring charges, with yearly cost |
-| `scheduled` | Upcoming scheduled transactions |
+| `scheduled` | Upcoming scheduled transactions, with ids |
 | `debts` | Cards, lines of credit and loans: owed, APR and minimum (loans), and whether each card's payment category covers its balance |
 | `payoff_plan` | Months to debt-free and total interest: minimums vs avalanche vs snowball, with an extra monthly amount. Card APRs aren't in YNAB's API, so pass them in. |
 
@@ -36,6 +36,7 @@ Not affiliated with or endorsed by YNAB.
 | `update_transactions` | Recategorize, approve, memo, flag (bulk) |
 | `create_transaction` | Add a transaction |
 | `transfer` | Record a transfer or card/loan payment between accounts |
+| `create_scheduled` / `update_scheduled` / `delete_scheduled` | Recurring or future transactions: bills, paychecks, scheduled transfers and card/loan payments |
 | `assign` | Set or add to a category's assigned amount for a month |
 | `move_money` | Move assigned money between categories |
 | `create_category` | Create one or many categories (with targets) in one approval; missing groups are created in the same change |

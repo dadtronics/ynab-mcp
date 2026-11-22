@@ -56,6 +56,10 @@ TXS = [tx(f"n{i}", ago(30 * i + 2), -15990, "StreamCo", "c3", "Streaming") for i
         {"amount": -50000, "category_id": "c1", "category_name": "Groceries", "deleted": False},
         {"amount": -30000, "category_id": "c2", "category_name": "Dining Out", "deleted": False}]),
 ]
+SCHEDULED = [{"id": "st1", "date_first": "2026-01-05", "date_next": (date.today() + timedelta(days=10)).isoformat(),
+              "frequency": "monthly", "amount": -15990, "memo": None, "flag_color": None, "account_id": "a1",
+              "account_name": "Checking", "payee_id": "p9", "payee_name": "StreamCo", "category_id": "c3",
+              "category_name": "Streaming", "deleted": False}]
 MONTH = {"month": date.today().replace(day=1).isoformat(), "to_be_budgeted": 25000, "income": 3000000,
          "budgeted": 730000, "activity": -578320, "age_of_money": 42, "categories": CATS}
 
@@ -81,7 +85,7 @@ class FakeAPI:
         if "/months/" in path:
             return {"month": MONTH}
         if "/scheduled_transactions" in path:
-            return {"scheduled_transactions": []}
+            return {"scheduled_transactions": SCHEDULED}
         if "/transactions" in path:
             if "type=uncategorized" in path:
                 return {"transactions": [t for t in TXS if not t["category_name"] and not t["transfer_account_id"]]}
@@ -264,6 +268,42 @@ class Tools(unittest.TestCase):
         self.assertIn("No changes", self.run_tool("recent_changes"))
         self.run_tool("confirm", code=code)
         self.assertIn("Move $5.00", self.run_tool("recent_changes"))
+
+    def test_scheduled_create_update_delete(self):
+        self.assertIn("id st1", self.run_tool("scheduled"))
+        soon = (date.today() + timedelta(days=3)).isoformat()
+        r = self.run_tool("create_scheduled", account="Checking", date=soon, amount=-120, payee="Power Co",
+                          category="Groceries")
+        self.assertIn(f"monthly starting {soon} | -$120.00 | Power Co | Groceries | Checking", r)
+        self.run_tool("confirm", code=self.staged_code(r))
+        body = self.writes()[-1][2]["scheduled_transaction"]
+        self.assertEqual((body["payee_name"], body["amount"], body["frequency"]), ("Power Co", -120000, "monthly"))
+        self.assertNotIn("payee_id", body)
+
+        r = self.run_tool("create_scheduled", account="Checking", date=soon, amount=-300, to_account="Example Card",
+                          frequency="everyOtherWeek")
+        self.run_tool("confirm", code=self.staged_code(r))
+        self.assertEqual(self.writes()[-1][2]["scheduled_transaction"]["payee_id"], "tp3")
+
+        r = self.run_tool("update_scheduled", scheduled="streamco", amount=-17.99)
+        self.assertIn("before: monthly", r)
+        self.assertIn("after:  monthly", r)
+        self.run_tool("confirm", code=self.staged_code(r))
+        m, path, body = self.writes()[-1]
+        self.assertEqual((m, path.rsplit("/", 1)[1]), ("PUT", "st1"))
+        self.assertEqual((body["scheduled_transaction"]["amount"], body["scheduled_transaction"]["payee_id"],
+                          body["scheduled_transaction"]["category_id"]), (-17990, "p9", "c3"))
+
+        r = self.run_tool("delete_scheduled", scheduled="st1")
+        self.run_tool("confirm", code=self.staged_code(r))
+        self.assertEqual(self.writes()[-1][:2], ("DELETE", "/budgets/last-used/scheduled_transactions/st1"))
+
+    def test_scheduled_refusals(self):
+        for args, msg in [({"date": "2020-01-01"}, "today or later"),
+                          ({"date": (date.today() + timedelta(days=1)).isoformat(), "category": "Credit Card Payments / Example Card"}, "credit card payment"),
+                          ({"date": (date.today() + timedelta(days=1)).isoformat(), "frequency": "fortnightly"}, "frequency must be")]:
+            with self.assertRaisesRegex(RuntimeError, msg):
+                self.run_tool("create_scheduled", account="Checking", amount=-5, **args)
 
     def test_refusals(self):
         for tool, args in [("update_transactions", {"changes": [{"id": "s1", "category": "Groceries"}]}),

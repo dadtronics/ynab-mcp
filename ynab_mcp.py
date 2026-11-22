@@ -345,7 +345,8 @@ def t_scheduled(a):
     st.sort(key=lambda s: s["date_next"])
     return "\n".join([f"{len(st)} scheduled transactions"] +
                      [f"next {s['date_next']} | {s['frequency']} | {money(s['amount'])} | {s.get('payee_name') or ''}"
-                      f" | {s.get('category_name') or ''} | {s['account_name']} | {s.get('memo') or ''}" for s in st])
+                      f" | {s.get('category_name') or ''} | {s['account_name']} | {s.get('memo') or ''} | id {s['id']}"
+                      for s in st])
 
 
 # ---------------------------------------------------------------- debt tools
@@ -539,6 +540,103 @@ def t_create_transaction(a):
         tx["category_id"], cname = c["id"], c["name"]
     return stage(f"Create transaction: {d} | {money(tx['amount'])} | {a.get('payee') or ''} | {cname} | {acc['name']}"
                  f" | {a.get('memo') or ''}", "POST", f"/budgets/{b}/transactions", {"transaction": tx}, b)
+
+
+FREQUENCIES = ["never", "daily", "weekly", "everyOtherWeek", "twiceAMonth", "every4Weeks", "monthly", "everyOtherMonth",
+               "every3Months", "every4Months", "twiceAYear", "yearly", "everyOtherYear"]
+
+
+def _scheduled_list(b):
+    return [x for x in api("GET", f"/budgets/{b}/scheduled_transactions", cache=False)["scheduled_transactions"]
+            if not x["deleted"]]
+
+
+def find_scheduled(b, want):
+    """By id, or by a payee/memo substring that matches exactly one scheduled transaction."""
+    st = _scheduled_list(b)
+    return find(st, want, "Scheduled transaction",
+                label=lambda x: f"{x.get('payee_name') or ''} {money(x['amount'])} {x['frequency']} next {x['date_next']}"
+                                + (f" ({x['memo']})" if x.get("memo") else ""))
+
+
+def _sched_fields(b, a, cur=None):
+    """Build a SaveScheduledTransaction body from tool args, starting from cur (an existing one) if given."""
+    cur = cur or {}
+    body = {k: cur.get(k) for k in ("account_id", "date", "amount", "payee_id", "category_id", "memo", "flag_color",
+                                     "frequency")} if cur else {}
+    if cur:
+        body["date"] = cur["date_next"]
+    labels = {"account": cur.get("account_name"), "payee": cur.get("payee_name"), "category": cur.get("category_name")}
+    if a.get("account"):
+        acc = find_account(b, a["account"])
+        body["account_id"], labels["account"] = acc["id"], acc["name"]
+    if a.get("date"):
+        d = date.fromisoformat(a["date"])
+        if d < date.today() or d > date.today().replace(year=date.today().year + 5):
+            raise RuntimeError("Scheduled date must be today or later, and at most 5 years out.")
+        body["date"] = a["date"]
+    if a.get("amount") is not None:
+        body["amount"] = to_milli(a["amount"])
+    if a.get("to_account"):
+        dst = find_account(b, a["to_account"])
+        body["payee_id"], labels["payee"] = dst["transfer_payee_id"], f"Transfer : {dst['name']}"
+        body.pop("payee_name", None)
+    elif a.get("payee"):
+        body["payee_id"], body["payee_name"], labels["payee"] = None, a["payee"], a["payee"]
+    if a.get("category"):
+        c = find_category(b, a["category"])
+        if c["group"] == "Credit Card Payments":
+            raise RuntimeError("YNAB doesn't allow scheduling into a credit card payment category; "
+                               "schedule a transfer to the card account instead (to_account).")
+        body["category_id"], labels["category"] = c["id"], c["name"]
+    if "memo" in a:
+        body["memo"] = a["memo"] or None
+    if a.get("frequency"):
+        if a["frequency"] not in FREQUENCIES:
+            raise RuntimeError("frequency must be one of: " + ", ".join(FREQUENCIES))
+        body["frequency"] = a["frequency"]
+    return body, labels
+
+
+def _sched_line(body, labels):
+    return (f"{body.get('frequency') or 'never'} starting {body.get('date')} | {money(body.get('amount'))} | "
+            f"{labels.get('payee') or ''} | {labels.get('category') or ('(transfer)' if str(labels.get('payee') or '').startswith('Transfer :') else 'Uncategorized')} | {labels.get('account')}"
+            + (f" | memo '{body['memo']}'" if body.get("memo") else ""))
+
+
+def t_create_scheduled(a):
+    b = budget_id(a)
+    if not a.get("date"):
+        raise RuntimeError("date is required (the first occurrence, today or later)")
+    body, labels = _sched_fields(b, {"frequency": "monthly", **a})
+    if "payee_name" in body and body.get("payee_id") is None:
+        body.pop("payee_id")
+    return stage("Create scheduled transaction: " + _sched_line(body, labels), "POST",
+                 f"/budgets/{b}/scheduled_transactions", {"scheduled_transaction": body}, b)
+
+
+def t_update_scheduled(a):
+    b = budget_id(a)
+    cur = find_scheduled(b, a["scheduled"])
+    body, labels = _sched_fields(b, a, cur)
+    if body.get("payee_id") is None and "payee_name" not in body:
+        body.pop("payee_id", None)
+    before = _sched_line({**{k: cur.get(k) for k in ("frequency", "amount", "memo")}, "date": cur["date_next"]},
+                         {"payee": cur.get("payee_name"), "category": cur.get("category_name"),
+                          "account": cur.get("account_name")})
+    return stage(f"Update scheduled transaction:\n- before: {before}\n- after:  {_sched_line(body, labels)}", "PUT",
+                 f"/budgets/{b}/scheduled_transactions/{cur['id']}", {"scheduled_transaction": body}, b)
+
+
+def t_delete_scheduled(a):
+    b = budget_id(a)
+    cur = find_scheduled(b, a["scheduled"])
+    line = _sched_line({"frequency": cur["frequency"], "amount": cur["amount"], "memo": cur.get("memo"),
+                        "date": cur["date_next"]},
+                       {"payee": cur.get("payee_name"), "category": cur.get("category_name"),
+                        "account": cur.get("account_name")})
+    return stage(f"Delete scheduled transaction: {line}\n(To undo, create it again with these details.)", "DELETE",
+                 f"/budgets/{b}/scheduled_transactions/{cur['id']}", None, b)
 
 
 def _month_cat(b, m, cid):
@@ -860,7 +958,7 @@ TOOLS = [
           "limit": {"type": "integer", "description": "Max rows (default 40)"}}), RO),
     ("recurring", t_recurring, "Detect subscriptions and other recurring charges from history, with yearly cost.",
      obj({"months": {"type": "integer", "description": "History to scan (default 6)"}}), RO),
-    ("scheduled", t_scheduled, "Upcoming scheduled transactions (bills entered in YNAB).", obj({}), RO),
+    ("scheduled", t_scheduled, "Upcoming scheduled transactions (bills, paychecks, transfers) with ids.", obj({}), RO),
     ("update_transactions", t_update_transactions,
      "Change existing transactions in bulk (category, approve, memo, flag).",
      obj({"changes": {"type": "array", "items": {"type": "object", "properties": {
@@ -872,6 +970,24 @@ TOOLS = [
      obj({"account": {"type": "string"}, "amount": {"type": "number"}, "payee": {"type": "string"},
           "category": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD (default today)"},
           "memo": {"type": "string"}}, ["account", "amount"]), RW),
+    ("create_scheduled", t_create_scheduled, "Create a scheduled (recurring) transaction, e.g. a bill or paycheck. "
+     "Amount in dollars, negative = outflow. Use to_account instead of payee for a scheduled transfer or card/loan "
+     "payment. Splits aren't supported by YNAB's API.",
+     obj({"account": {"type": "string"}, "date": {"type": "string", "description": "First occurrence, YYYY-MM-DD (today or later)"},
+          "amount": {"type": "number"}, "payee": {"type": "string"},
+          "to_account": {"type": "string", "description": "Make it a transfer to this account instead of a payee"},
+          "category": {"type": "string"}, "memo": {"type": "string"},
+          "frequency": {"type": "string", "enum": FREQUENCIES, "description": "Default monthly; 'never' = one-time"}},
+         ["account", "date", "amount"]), RW),
+    ("update_scheduled", t_update_scheduled, "Change a scheduled transaction (only the fields you pass change). "
+     "Find it by id from the scheduled tool, or by a payee name that matches only one.",
+     obj({"scheduled": {"type": "string", "description": "Id or unique payee name"},
+          "account": {"type": "string"}, "date": {"type": "string", "description": "Next occurrence, YYYY-MM-DD"},
+          "amount": {"type": "number"}, "payee": {"type": "string"}, "to_account": {"type": "string"},
+          "category": {"type": "string"}, "memo": {"type": "string"},
+          "frequency": {"type": "string", "enum": FREQUENCIES}}, ["scheduled"]), RW),
+    ("delete_scheduled", t_delete_scheduled, "Delete a scheduled transaction (by id or unique payee name).",
+     obj({"scheduled": {"type": "string", "description": "Id or unique payee name"}}, ["scheduled"]), RW),
     ("assign", t_assign, "Assign money to a category for a month (mode set = new total, add = add to current).",
      obj({**MONTH, "category": {"type": "string"}, "amount": {"type": "number"},
           "mode": {"type": "string", "enum": ["set", "add"]}}, ["category", "amount"]), RW),
