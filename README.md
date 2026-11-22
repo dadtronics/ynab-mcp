@@ -5,9 +5,12 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI agent read and 
 category changes, with every write held for your approval.
 
 - **One file, Python standard library only.** No pip install, no dependencies.
-- **Writes are two-phase.** A write tool only *stages* a change and returns a before → after preview.
+- **Confirm-first by default.** A write tool only *stages* a change and returns a before → after preview.
   Nothing reaches YNAB until a separate `confirm` call, which the agent is told to make only after you say yes.
   You can also make your MCP client prompt you before `confirm` runs (see below).
+  Prefer less friction? Run with `--direct` and changes apply immediately.
+- **Every applied change is logged** with before → after values, and `recent_changes` lets the agent read
+  the log, so "undo that" works.
 - **Works with local models.** Tool output is compact text with exact numbers, so smaller models
   (e.g. a 27B Qwen through llama.cpp) handle it well. With a local model your financial data never leaves your network.
 
@@ -39,7 +42,8 @@ Not affiliated with or endorsed by YNAB.
 | `update_category` | Rename, note, move to another group, add/change/remove targets; one or many in one approval |
 | `create_category_group` / `rename_category_group` | Manage groups |
 | `create_account` | Checking, savings, cash, credit card, other asset/liability |
-| `confirm` | Apply staged changes by code (`codes` applies several approved changes at once) |
+| `confirm` | Apply staged changes by code (`codes` applies several approved changes at once). Not present in `--direct` mode. |
+| `recent_changes` (read) | Applied changes, newest first, with before → after values for undo |
 
 Budgets, categories and accounts can be referred to by name (case-insensitive; a unique substring is fine).
 Categories also accept `Group / Name`, the form the `categories` tool prints.
@@ -103,6 +107,19 @@ creating loan accounts or editing loan details; recategorizing split transaction
 Then ask things like *"give me a YNAB overview"*, *"what are my recurring charges?"*,
 *"categorize my uncategorized transactions"*, or *"how fast can I pay off my debts with $200/month extra?
 My card APR is 24.99%"*.
+
+## Write modes
+
+| | Confirm (default) | Direct (`--direct` or `YNAB_WRITE_MODE=direct`) |
+|---|---|---|
+| Write tools | Stage a change, return preview + code | Apply immediately |
+| Applying | `confirm` with the code(s) | n/a |
+| Rule checks (e.g. card payment target limits) | Before staging | Before applying |
+| Change log | Yes | Yes |
+
+YNAB's API can't touch bank connections or move real money, and everything it changes can be changed back,
+so direct mode is a reasonable choice for your own budget. Change log location: `~/.local/state/ynab-mcp/changes.jsonl`
+(override with `YNAB_CHANGE_LOG`).
 
 ## Notes
 

@@ -24,6 +24,10 @@ CACHE_TTL = 120     # seconds to reuse GET responses (rate limit is 200/hour)
 
 _cache = {}
 _pending = {}
+# Write mode: "confirm" (default) stages every change for approval; "direct" (--direct or YNAB_WRITE_MODE=direct)
+# applies changes immediately. Either way every applied change is appended to the change log.
+DIRECT = os.environ.get("YNAB_WRITE_MODE", "").lower() == "direct"
+CHANGE_LOG = os.path.expanduser(os.environ.get("YNAB_CHANGE_LOG", "~/.local/state/ynab-mcp/changes.jsonl"))
 
 
 def log(*a):
@@ -474,9 +478,11 @@ def stage(description, method, path, body, budget):
     for k in [k for k, v in _pending.items() if now - v["at"] > PENDING_TTL]:
         del _pending[k]
     _pending[code] = {"at": now, "method": method, "path": path, "body": body, "desc": description, "budget": budget}
+    if DIRECT:
+        return _apply(code, _pending.pop(code)) + "\n(Applied immediately. recent_changes shows what changed, for undo.)"
     return (f"STAGED, NOT APPLIED. Proposed change:\n{description}\n\n"
-            f"Show this to the user exactly and ask them to approve it. Only if they say yes, call "
-            f"confirm with code {code}. If they say no, do nothing (it expires in 30 minutes).")
+            f"Show the user this change (every item) and get their go-ahead, then call confirm with code {code}. "
+            f"It expires in 30 minutes.")
 
 
 def t_update_transactions(a):
@@ -761,6 +767,13 @@ def _apply(code, p):
         if len(step) > 3 and step[3]:
             refs[step[3]] = data["category_group"]["id"]
     log("applied", code, p["desc"].splitlines()[0])
+    try:
+        os.makedirs(os.path.dirname(CHANGE_LOG), exist_ok=True)
+        with open(CHANGE_LOG, "a") as f:
+            f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"), "code": code,
+                                "budget": p.get("budget"), "description": p["desc"]}) + "\n")
+    except OSError as e:
+        log("could not write change log:", e)
     return f"APPLIED:\n{p['desc']}"
 
 
@@ -779,6 +792,20 @@ def t_confirm(a):
         except RuntimeError as e:
             raise RuntimeError(f"{e}" + (f"\nAlready applied before this failure:\n" + "\n".join(done) if done else ""))
     return "\n\n".join(done)
+
+
+def t_recent_changes(a):
+    n = int(a.get("limit", 10))
+    try:
+        with open(CHANGE_LOG) as f:
+            entries = [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        return "No changes have been applied yet."
+    out = [f"Last {min(n, len(entries))} of {len(entries)} applied changes (newest first). Each shows before -> after, "
+           "so to undo, apply the reverse with the normal tools."]
+    for e in reversed(entries[-n:]):
+        out.append(f"\n[{e['time']}]\n{e['description']}")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- MCP plumbing
@@ -829,23 +856,20 @@ TOOLS = [
      obj({"months": {"type": "integer", "description": "History to scan (default 6)"}}), RO),
     ("scheduled", t_scheduled, "Upcoming scheduled transactions (bills entered in YNAB).", obj({}), RO),
     ("update_transactions", t_update_transactions,
-     "STAGE changes to existing transactions (category, approve, memo, flag). Returns a preview and a code; "
-     "nothing changes until the user approves and you call confirm.",
+     "Change existing transactions in bulk (category, approve, memo, flag).",
      obj({"changes": {"type": "array", "items": {"type": "object", "properties": {
          "id": {"type": "string"}, "category": {"type": "string"}, "approved": {"type": "boolean"},
          "memo": {"type": "string"},
          "flag_color": {"type": "string", "enum": ["", "red", "orange", "yellow", "green", "blue", "purple"]}},
          "required": ["id"]}}}, ["changes"]), RW),
-    ("create_transaction", t_create_transaction, "STAGE a new transaction (amount in dollars, negative = outflow). "
-     "Needs user approval + confirm.",
+    ("create_transaction", t_create_transaction, "Create a transaction (amount in dollars, negative = outflow).",
      obj({"account": {"type": "string"}, "amount": {"type": "number"}, "payee": {"type": "string"},
           "category": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD (default today)"},
           "memo": {"type": "string"}}, ["account", "amount"]), RW),
-    ("assign", t_assign, "STAGE assigning money to a category for a month (mode set = new total, add = add to current). "
-     "Needs user approval + confirm.",
+    ("assign", t_assign, "Assign money to a category for a month (mode set = new total, add = add to current).",
      obj({**MONTH, "category": {"type": "string"}, "amount": {"type": "number"},
           "mode": {"type": "string", "enum": ["set", "add"]}}, ["category", "amount"]), RW),
-    ("move_money", t_move_money, "STAGE moving assigned money between two categories. Needs user approval + confirm.",
+    ("move_money", t_move_money, "Move assigned money between two categories.",
      obj({**MONTH, "from_category": {"type": "string"}, "to_category": {"type": "string"},
           "amount": {"type": "number", "description": "Positive dollars"}}, ["from_category", "to_category", "amount"]), RW),
     ("debts", t_debts, "All credit cards, lines of credit and loans: amount owed, APR and minimum payment (loans), "
@@ -859,9 +883,9 @@ TOOLS = [
           "minimum_payments": {"type": "object", "description": "Account name -> monthly minimum in dollars",
                                "additionalProperties": {"type": "number"}},
           "accounts": {"type": "array", "items": {"type": "string"}, "description": "Only these debts"}}), RO),
-    ("create_category", t_create_category, "STAGE creating one or many categories, optionally with targets. "
-     "For several, pass them all in `categories` so the user approves once. A group that doesn't exist yet is "
-     "created in the same change. Needs user approval + confirm.",
+    ("create_category", t_create_category, "Create one or many categories, optionally with targets. "
+     "For several, pass them all in `categories`. A group that doesn't exist yet is "
+     "created in the same change.",
      obj({"name": {"type": "string", "description": "Single category name (or use categories)"},
           "group": {"type": "string", "description": "Group name; created if it doesn't exist"},
           "note": {"type": "string"}, **TARGET,
@@ -869,46 +893,70 @@ TOOLS = [
                          "items": {"type": "object", "properties": {
                              "name": {"type": "string"}, "group": {"type": "string"}, "note": {"type": "string"},
                              **TARGET}, "required": ["name", "group"]}}}), RW),
-    ("update_category", t_update_category, "STAGE (one or, via changes, many) renaming a category, editing its note, moving it to another group, "
-     "or adding/changing/removing its target. Needs user approval + confirm. (Deleting/hiding categories is not "
+    ("update_category", t_update_category, "Rename one or many (via changes) categories, edit notes, move to another group, "
+     "or add/change/remove targets. (Deleting/hiding categories is not "
      "possible through the API; the user must do that in YNAB.)",
      obj({**UPDATE_CAT, "changes": {"type": "array", "description": "Several categories at once (one approval)",
                                      "items": {"type": "object", "properties": UPDATE_CAT, "required": ["category"]}}}), RW),
-    ("create_category_group", t_create_category_group, "STAGE creating a category group. Needs user approval + confirm.",
+    ("create_category_group", t_create_category_group, "Create a category group.",
      obj({"name": {"type": "string"}}, ["name"]), RW),
-    ("rename_category_group", t_rename_category_group, "STAGE renaming a category group. Needs user approval + confirm.",
+    ("rename_category_group", t_rename_category_group, "Rename a category group.",
      obj({"group": {"type": "string"}, "new_name": {"type": "string"}}, ["group", "new_name"]), RW),
-    ("transfer", t_transfer, "STAGE recording a transfer between accounts, e.g. a credit card or loan payment from "
-     "checking. Records it in YNAB only. Needs user approval + confirm.",
+    ("transfer", t_transfer, "Record a transfer between accounts, e.g. a credit card or loan payment from "
+     "checking. Records it in YNAB only.",
      obj({"from_account": {"type": "string"}, "to_account": {"type": "string"},
           "amount": {"type": "number", "description": "Positive dollars"},
           "date": {"type": "string", "description": "YYYY-MM-DD (default today)"}, "memo": {"type": "string"}},
          ["from_account", "to_account", "amount"]), RW),
-    ("create_account", t_create_account, "STAGE creating a budget account (loan accounts can't be created through the API). "
-     "Needs user approval + confirm.",
+    ("create_account", t_create_account, "Create a budget account (loan accounts can't be created through the API).",
      obj({"name": {"type": "string"},
           "type": {"type": "string", "enum": ["checking", "savings", "cash", "creditCard", "otherAsset", "otherLiability"]},
           "balance": {"type": "number", "description": "Starting balance in dollars (negative for a card owing money)"}},
          ["name", "type"]), RW),
-    ("confirm", t_confirm, "Apply a staged change. ONLY call this after the user has seen the preview and explicitly "
-     "said yes in their own message. Pass several approved codes in codes to apply them together.",
+    ("recent_changes", t_recent_changes, "Changes this server applied to YNAB, newest first, with before -> after values. "
+     "Use it to answer 'what did you change?' or to undo something.",
+     {"type": "object", "properties": {"limit": {"type": "integer", "description": "How many (default 10)"}}}, RO),
+    ("confirm", t_confirm, "Apply staged changes after the user has seen them and given the go-ahead. "
+     "Pass several approved codes in codes to apply them together.",
      {"type": "object", "properties": {"code": {"type": "string"},
                                        "codes": {"type": "array", "items": {"type": "string"}}}},
      {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True}),
 ]
 BY_NAME = {t[0]: t for t in TOOLS}
 
-INSTRUCTIONS = (
+COMMON = (
     "YNAB budget tools. Amounts are dollars; outflows negative. Refer to budgets by name (from the budgets tool) "
     "and to categories/accounts by name; 'Group / Name' as printed by the categories tool also works. "
-    "Start with overview. Write tools only STAGE a change and return a preview + code. Workflow for changes: "
-    "(1) put ALL related changes in as few calls as possible: create_category with a categories list (missing groups "
-    "are created automatically, so never stage create_category_group first), update_category with a changes list; "
-    "(2) show every preview to the user word for word and stop; (3) only after the user says yes, call confirm once "
-    "with all the approved codes in codes. Never confirm in the same turn you staged, never on your own initiative. "
-    "Changes staged together don't see each other until confirmed, so don't stage a change that depends on another "
-    "unconfirmed one. Report numbers exactly as the tools give them."
+    "Read and analyze freely, interpret requests by intent, and point out problems or improvements you notice. "
+    "Group related changes into as few calls as possible: create_category with a categories list (missing groups "
+    "are created automatically), update_category with a changes list. Use the numbers the tools return; don't estimate. "
 )
+INSTRUCTIONS_CONFIRM = COMMON + (
+    "Write tools only STAGE a change and return a preview + code. Summarize the previews for the user (every change "
+    "must be listed), then wait for their go-ahead and call confirm once with all approved codes. Don't confirm "
+    "without the user's go-ahead. Changes staged together don't see each other until confirmed."
+)
+INSTRUCTIONS_DIRECT = COMMON + (
+    "Write tools apply changes IMMEDIATELY. For a clear request, just do it and then tell the user briefly what "
+    "changed. If a request is ambiguous or would change a lot at once (e.g. more than ~15 items), outline the plan "
+    "in a few lines first. recent_changes lists everything applied, with before -> after, for undo."
+)
+
+
+def instructions():
+    return INSTRUCTIONS_DIRECT if DIRECT else INSTRUCTIONS_CONFIRM
+
+
+def tool_list():
+    out = []
+    for n, _, d, sch, ann in TOOLS:
+        if n == "confirm" and DIRECT:
+            continue
+        if not ann.get("readOnlyHint") and n != "confirm":
+            d += (" Applies immediately." if DIRECT else
+                  " Staged only: returns a preview + code; nothing changes until confirm is called with the code.")
+        out.append({"name": n, "description": d, "inputSchema": sch, "annotations": ann})
+    return out
 
 
 def send(msg):
@@ -917,6 +965,9 @@ def send(msg):
 
 
 def main():
+    global DIRECT
+    if "--direct" in sys.argv[1:]:
+        DIRECT = True
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -931,11 +982,10 @@ def main():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": params.get("protocolVersion", PROTOCOL),
-                "capabilities": {"tools": {}}, "instructions": INSTRUCTIONS,
+                "capabilities": {"tools": {}}, "instructions": instructions(),
                 "serverInfo": {"name": "ynab", "version": "1.0"}}})
         elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
-                {"name": n, "description": d, "inputSchema": s, "annotations": ann} for n, _, d, s, ann in TOOLS]}})
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": tool_list()}})
         elif method == "tools/call":
             name, args = params.get("name"), params.get("arguments") or {}
             if name not in BY_NAME:

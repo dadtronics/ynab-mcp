@@ -93,13 +93,19 @@ class FakeAPI:
 
 class Tools(unittest.TestCase):
     def setUp(self):
+        import tempfile
         self.api = FakeAPI()
         self._real = y.api
         y.api = self.api
         y._pending.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        y.CHANGE_LOG = os.path.join(self.tmp.name, "changes.jsonl")
+        y.DIRECT = False
 
     def tearDown(self):
         y.api = self._real
+        y.DIRECT = False
+        self.tmp.cleanup()
 
     def run_tool(self, tool, /, **args):
         return y.BY_NAME[tool][1](args)
@@ -235,6 +241,24 @@ class Tools(unittest.TestCase):
         self.staged_code(self.run_tool("update_category", category="Streaming", target_amount=20,
                                        target_frequency="monthly", target_mode="refill"))
 
+    def test_direct_mode_applies_and_logs(self):
+        y.DIRECT = True
+        r = self.run_tool("assign", category="Dining", amount=50, mode="add")
+        self.assertIn("APPLIED", r)
+        self.assertEqual(len(self.writes()), 1)
+        self.assertEqual(y._pending, {})
+        log = self.run_tool("recent_changes")
+        self.assertIn("Dining Out for current: $100.00 -> $150.00", log)
+        self.assertNotIn("confirm", [t["name"] for t in y.tool_list()])
+        with self.assertRaisesRegex(RuntimeError, "credit card payment"):  # rules still checked
+            self.run_tool("update_category", category="Example Card", target_frequency="monthly", target_amount=5)
+
+    def test_confirm_mode_logs_only_applied(self):
+        code = self.staged_code(self.run_tool("move_money", from_category="Groceries", to_category="Dining Out", amount=5))
+        self.assertIn("No changes", self.run_tool("recent_changes"))
+        self.run_tool("confirm", code=code)
+        self.assertIn("Move $5.00", self.run_tool("recent_changes"))
+
     def test_refusals(self):
         for tool, args in [("update_transactions", {"changes": [{"id": "s1", "category": "Groceries"}]}),
                            ("create_category", {"name": "Groceries", "group": "everyday"}),
@@ -257,7 +281,18 @@ class Protocol(unittest.TestCase):
         out = [json.loads(l) for l in p.stdout.splitlines()]
         self.assertEqual(out[0]["result"]["serverInfo"]["name"], "ynab")
         self.assertEqual(len(out[1]["result"]["tools"]), len(y.TOOLS))
+        self.assertIn("STAGE", out[0]["result"]["instructions"])
         self.assertTrue(out[2]["result"]["isError"])
+
+    def test_stdio_direct(self):
+        msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "ynab_mcp.py"), "--direct"], text=True,
+                           input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, timeout=30,
+                           env={**os.environ, "YNAB_TOKEN": "test"})
+        out = [json.loads(l) for l in p.stdout.splitlines()]
+        self.assertIn("IMMEDIATELY", out[0]["result"]["instructions"])
+        self.assertEqual(len(out[1]["result"]["tools"]), len(y.TOOLS) - 1)
 
 
 if __name__ == "__main__":
