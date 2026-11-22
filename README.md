@@ -123,7 +123,7 @@ so direct mode is a reasonable choice for your own budget. Change log location: 
 
 ## Notes
 
-- YNAB allows 200 API requests per hour per token. Read responses are cached for 2 minutes.
+- YNAB allows 200 API requests per hour per token. Read responses are cached for 30 seconds.
 - Staged changes expire after 30 minutes and can be confirmed once.
 - `payoff_plan` is an estimate: fixed APRs, no new charges, monthly compounding.
 - Requires Python 3.9+.

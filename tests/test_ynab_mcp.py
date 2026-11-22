@@ -123,6 +123,12 @@ class Tools(unittest.TestCase):
         self.assertIn("Dining Out: available -$50.00", r)
         self.assertIn("Streaming: needs $10.00 more", r)
 
+    def test_categories_grouped_and_complete(self):
+        r = self.run_tool("categories")
+        self.assertIn("5 categories in 3 groups (complete list", r)
+        self.assertIn("\n## Everyday\nGroceries | $600.00", r)
+        self.assertNotIn("Everyday / Groceries", r)
+
     def test_transactions_and_splits(self):
         r = self.run_tool("transactions", since=ago(200))
         self.assertIn("Groceries -$50.00 + Dining Out -$30.00", r)

@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta
 API = "https://api.ynab.com/v1"
 PROTOCOL = "2025-06-18"
 PENDING_TTL = 1800  # staged writes expire after 30 min
-CACHE_TTL = 120     # seconds to reuse GET responses (rate limit is 200/hour)
+CACHE_TTL = 30      # seconds to reuse GET responses (rate limit is 200/hour; short so edits made in the YNAB app show up)
 
 _cache = {}
 _pending = {}
@@ -219,13 +219,20 @@ GOAL_TYPES = {"TB": "target balance", "TBD": "target balance by date", "MF": "mo
 def t_categories(a):
     b = budget_id(a)
     m = api("GET", f"/budgets/{b}/months/{month_arg(a.get('month'))}")["month"]
-    cats = {c["id"]: c for c in categories(b)}
+    month = {c["id"]: c for c in m["categories"]}
     grp = a.get("group", "").lower()
+    cats = [c for c in categories(b) if c["id"] in month and (not grp or grp in c["group"].lower())]
+    ngroups = len({c["group"] for c in cats})
     out = [f"Month {m['month'][:7]} | Ready to Assign {money(m['to_be_budgeted'])}",
-           "group / category | assigned | activity | available | goal"]
-    for c in m["categories"]:
-        if c["id"] not in cats or (grp and grp not in cats[c["id"]]["group"].lower()):
-            continue
+           f"{len(cats)} categories in {ngroups} groups (complete list" + (f", groups matching '{a['group']}'" if grp else "")
+           + "). Each '## ' line is a group; the lines under it are its categories:",
+           "category | assigned | activity | available | target"]
+    current = None
+    for cat in cats:
+        c = month[cat["id"]]
+        if cat["group"] != current:
+            current = cat["group"]
+            out.append(f"\n## {current}")
         goal = ""
         if c.get("goal_type"):
             goal = f"{GOAL_TYPES.get(c['goal_type'], c['goal_type'])} {money(c.get('goal_target'))}"
@@ -235,8 +242,7 @@ def t_categories(a):
                 goal += f", {c['goal_percentage_complete']}% done"
             if c.get("goal_under_funded"):
                 goal += f", underfunded {money(c['goal_under_funded'])}"
-        out.append(f"{cats[c['id']]['group']} / {c['name']} | {money(c['budgeted'])} | {money(c['activity'])}"
-                   f" | {money(c['balance'])} | {goal or '-'}")
+        out.append(f"{c['name']} | {money(c['budgeted'])} | {money(c['activity'])} | {money(c['balance'])} | {goal or '-'}")
     return "\n".join(out)
 
 
@@ -826,7 +832,7 @@ def obj(props, req=()):
 RO = {"readOnlyHint": True, "openWorldHint": True}
 RW = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True}
 
-UPDATE_CAT = {"category": {"type": "string", "description": "Name, or 'Group / Name' as the categories tool shows"},
+UPDATE_CAT = {"category": {"type": "string", "description": "Category name (or 'Group / Name')"},
               "new_name": {"type": "string"}, "note": {"type": "string"},
               "group": {"type": "string", "description": "Move to this existing group"},
               "remove_target": {"type": "boolean"}, **TARGET}
@@ -926,7 +932,7 @@ BY_NAME = {t[0]: t for t in TOOLS}
 
 COMMON = (
     "YNAB budget tools. Amounts are dollars; outflows negative. Refer to budgets by name (from the budgets tool) "
-    "and to categories/accounts by name; 'Group / Name' as printed by the categories tool also works. "
+    "and to categories/accounts by name ('Group / Name' also works). "
     "Read and analyze freely, interpret requests by intent, and point out problems or improvements you notice. "
     "Group related changes into as few calls as possible: create_category with a categories list (missing groups "
     "are created automatically), update_category with a changes list. Use the numbers the tools return; don't estimate. "
