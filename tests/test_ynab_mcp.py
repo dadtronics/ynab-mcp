@@ -284,6 +284,12 @@ class Tools(unittest.TestCase):
                           frequency="everyOtherWeek")
         self.run_tool("confirm", code=self.staged_code(r))
         self.assertEqual(self.writes()[-1][2]["scheduled_transaction"]["payee_id"], "tp3")
+        self.assertEqual(self.writes()[-1][2]["scheduled_transaction"]["amount"], -300000)
+        # positive amount with to_account must still be money leaving Checking (this went the wrong way in real use)
+        r = self.run_tool("create_scheduled", account="Checking", date=soon, amount=758, to_account="Example Card")
+        self.assertIn("-$758.00 | Transfer : Example Card | (transfer) | Checking", r)
+        self.run_tool("confirm", code=self.staged_code(r))
+        self.assertEqual(self.writes()[-1][2]["scheduled_transaction"]["amount"], -758000)
 
         r = self.run_tool("update_scheduled", scheduled="streamco", amount=-17.99)
         self.assertIn("before: monthly", r)

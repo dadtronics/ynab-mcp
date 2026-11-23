@@ -581,6 +581,10 @@ def _sched_fields(b, a, cur=None):
         dst = find_account(b, a["to_account"])
         body["payee_id"], labels["payee"] = dst["transfer_payee_id"], f"Transfer : {dst['name']}"
         body.pop("payee_name", None)
+    if a.get("to_account") or str(labels.get("payee") or "").startswith("Transfer :"):
+        # A transfer TO another account is money leaving this one: always an outflow, whatever sign was passed.
+        if body.get("amount"):
+            body["amount"] = -abs(body["amount"])
     elif a.get("payee"):
         body["payee_id"], body["payee_name"], labels["payee"] = None, a["payee"], a["payee"]
     if a.get("category"):
@@ -971,8 +975,9 @@ TOOLS = [
           "category": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD (default today)"},
           "memo": {"type": "string"}}, ["account", "amount"]), RW),
     ("create_scheduled", t_create_scheduled, "Create a scheduled (recurring) transaction, e.g. a bill or paycheck. "
-     "Amount in dollars, negative = outflow. Use to_account instead of payee for a scheduled transfer or card/loan "
-     "payment. Splits aren't supported by YNAB's API.",
+     "Amount in dollars, negative = outflow. For a scheduled transfer or card/loan payment, use to_account instead "
+     "of payee: money then always goes FROM account TO to_account (sign of amount is ignored). "
+     "Splits aren't supported by YNAB's API.",
      obj({"account": {"type": "string"}, "date": {"type": "string", "description": "First occurrence, YYYY-MM-DD (today or later)"},
           "amount": {"type": "number"}, "payee": {"type": "string"},
           "to_account": {"type": "string", "description": "Make it a transfer to this account instead of a payee"},
